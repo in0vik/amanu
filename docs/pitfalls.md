@@ -116,17 +116,44 @@ up with the recording nor attributed to a speaker.
 speakers, and `chunking_strategy` is required with it for any audio over 30
 seconds — without that field the API answers 400 rather than transcribing.
 
-Its 25 MB per request is a real limit, not a guideline: the mix reaches it at
-around 55 minutes, so `AudioSlicer` cuts longer meetings up. Speaker labels are
-per request, so they are prefixed per piece rather than merged — the "A" of the
-second piece is not the "A" of the first, and treating them as one person would
-hand two strangers one name. That is not a theory: a four-minute mix run
-through the real API in four pieces on 19 August came back with the Russian
-voice labelled `1A` in the first piece and `4B` in the last.
+It has two limits per request, and the one that matters is not the one that
+looks like it. 25 MB is real — a larger file is refused with "Audio file might
+be corrupted or unsupported", which says nothing about size — but 1400 seconds
+of audio is reached first: "audio duration … is longer than 1400 seconds which
+is the maximum for this model". Until October 2026 `AudioSlicer` knew only the
+bytes, so every meeting over 23 minutes failed, and failed as permanent: 30
+recordings in a row on one machine, every one of them longer than that and
+none shorter. Pieces are now at most `defaultDurationLimit` (1300 s) long, cut
+at the quietest half second near an even split, and sized for bytes at the
+64k they are written at rather than at the mix's own bitrate.
 
-Both paths have been run against the API for real — one request, and four —
-which is what `requestLimit` being an init parameter is for: proving the sliced
-path costs four minutes of audio rather than an hour of it.
+Speaker labels are per request. Left alone, the "A" of the second piece is
+not the "A" of the first — a four-minute mix run through the real API in four
+pieces on 19 August came back with the Russian voice labelled `1A` in the
+first piece and `4B` in the last — so the first piece is sent alone, and up to
+four of its voices go with every later piece as `known_speaker_names[]` and
+`known_speaker_references[]`: a two-to-eight-second 16 kHz WAV of each, as a
+`data:audio/wav;base64,` URL. Checked against the API on 28 October 2026: a
+second piece sent with samples of the first piece's `B` and `D` came back
+labelled `B` and `D`. A voice nobody sampled still gets a label of its own
+piece, prefixed so it cannot pass for someone else. Sending the URL from
+`curl` needs `--form-string`: `-F` reads the `;` in `audio/wav;base64` as one
+of its own options, and the API answers "must be base64-encoded audio data".
+
+The server takes seven to nine minutes to answer for a twenty-minute piece,
+and says nothing meanwhile unless asked to stream. On 28 October 2026 amanu
+sent such a piece without `stream` and was never answered — the request waited
+out its thirty-minute timeout — while curl sent the same piece twice, with TCP
+keepalive and without, and was answered both times. Nobody knows why, so the
+requests are streamed: `stream=true` with `diarized_json` sends each segment as
+a server-sent event as it is ready, `: ping` comments between them, a
+`transcript.text.done` and `[DONE]`. A stream that stops before
+`transcript.text.done` is a piece cut short, not a short piece, and is not
+cached.
+
+Both paths have been run against the API for real, which is what
+`requestLimit` and `durationLimit` being init parameters are for: proving the
+sliced path costs a few minutes of audio rather than an hour of it.
 
 ## The live engine reports the whole transcript, every chunk
 
