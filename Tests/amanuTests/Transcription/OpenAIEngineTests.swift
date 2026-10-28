@@ -224,6 +224,14 @@ struct OpenAIEngineTests {
         #expect(OpenAITranscriptionEngine.parse(Data("<html>bad gateway</html>".utf8)) == nil)
     }
 
+    @Test("A stream that reports an error is no answer either, whatever else it sent")
+    func streamWithError() {
+        let failed = Self.stream.replacingOccurrences(
+            of: "data: [DONE]",
+            with: #"data: {"type":"error","error":{"message":"server_error"}}"#)
+        #expect(OpenAITranscriptionEngine.parse(Data(failed.utf8)) == nil)
+    }
+
     @Test("A plain JSON answer is still read, for a proxy that ignores stream")
     func plainResponse() throws {
         let response = try #require(OpenAITranscriptionEngine.parse(Data("""

@@ -138,4 +138,48 @@ struct SlicedTranscriptionTests {
         #expect(stub.requests.count == 3)
         #expect(segments.map(\.speaker) == ["1A", "2A"])
     }
+
+    /// One piece of a real meeting came back with its segments and no closing
+    /// event. Asked again, it is answered; the meeting is not given up on.
+    @Test("A piece whose answer stops short is asked for again")
+    func truncatedPieceIsRetried() async throws {
+        let dir = try Self.folder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let audio = try Self.speechWithGaps(seconds: 100, gaps: [48], in: dir)
+
+        let whole = #"""
+        data: {"type":"transcript.text.segment","text":"hi","speaker":"A","start":0,"end":4}
+
+        data: {"type":"transcript.text.done","text":"hi"}
+
+        data: [DONE]
+
+        """#
+        let cut = #"""
+        data: {"type":"transcript.text.segment","text":"hi","speaker":"A","start":0,"end":4}
+
+        """#
+        let stub = StubHTTP { _, count in .json(200, count == 2 ? cut : whole) }
+        let engine = try OpenAITranscriptionEngine(
+            durationLimit: 60, apiKey: "test-key", session: stub.session, retry: .once)
+        let segments = try await engine.transcribe(audio)
+
+        #expect(stub.requests.count == 3)
+        #expect(segments.map(\.speaker) == ["1A", "2A"])
+    }
+
+    @Test("A piece that never finishes fails the meeting after three tries")
+    func truncatedPieceGivesUp() async throws {
+        let dir = try Self.folder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let audio = try Self.speechWithGaps(seconds: 30, gaps: [], in: dir)
+
+        let stub = StubHTTP { _, _ in
+            .json(200, "data: {\"type\":\"transcript.text.segment\",\"text\":\"hi\",\"start\":0,\"end\":1}\n\n")
+        }
+        let engine = try OpenAITranscriptionEngine(
+            apiKey: "test-key", session: stub.session, retry: .once)
+        await #expect(throws: CloudHTTP.Failure.self) { try await engine.transcribe(audio) }
+        #expect(stub.requests.count == OpenAITranscriptionEngine.streamAttempts)
+    }
 }

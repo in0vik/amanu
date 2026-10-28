@@ -189,34 +189,51 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             note("reusing cached \(cache.lastPathComponent)")
             return decoded
         }
-        let raw: Data
+        // A stream can stop before it is finished — on 29 October 2026 one piece
+        // of an hour-long meeting did, sending its segments but never the
+        // closing event. Asking again costs one piece, not the meeting.
+        var ending = ""
+        for attempt in 1...Self.streamAttempts {
+            let raw = try await sendAllowingVoices(slice.url, voices: voices)
+            if let decoded = Self.parse(raw) {
+                if let encoded = try? JSONEncoder().encode(decoded) {
+                    try? encoded.write(to: cache, options: .atomic)
+                }
+                return decoded
+            }
+            // The end, not the start: the start of a stream cut short looks
+            // exactly like the start of a whole one.
+            ending = String(decoding: raw.suffix(400), as: UTF8.self)
+            note("\(slice.url.lastPathComponent): the answer stopped before it was finished"
+                + " (try \(attempt) of \(Self.streamAttempts)); it ended with: \(ending)")
+        }
+        throw CloudHTTP.Failure.malformed(
+            service: CloudService.openAI.rawValue, what: "transcription", body: ending)
+    }
+
+    /// Tries per piece for an answer that stops before it is finished.
+    static let streamAttempts = 3
+
+    private func sendAllowingVoices(_ audio: URL, voices: [Voice]) async throws -> Data {
         do {
-            raw = try await send(slice.url, voices: voices)
+            return try await send(audio, voices: voices)
         } catch let failure as CloudHTTP.Failure
             where !voices.isEmpty && Self.refusedVoices(failure) {
             // The samples are a refinement. A service that will not take them
             // still transcribes the piece, and separate labels beat no text.
-            note("voice samples refused, sending \(slice.url.lastPathComponent) without them: \(failure)")
-            raw = try await send(slice.url, voices: [])
+            note("voice samples refused, sending \(audio.lastPathComponent) without them: \(failure)")
+            return try await send(audio, voices: [])
         }
-        guard let decoded = Self.parse(raw) else {
-            throw CloudHTTP.Failure.malformed(
-                service: CloudService.openAI.rawValue, what: "transcription",
-                body: String(decoding: raw.prefix(400), as: UTF8.self))
-        }
-        if let encoded = try? JSONEncoder().encode(decoded) {
-            try? encoded.write(to: cache, options: .atomic)
-        }
-        return decoded
     }
 
     /// A response as the API sends it with `stream=true`: server-sent events,
     /// one `transcript.text.segment` per utterance, a `transcript.text.done`
     /// with the whole text, comments to keep the connection open, and
     /// `[DONE]`. A plain JSON body is taken as well, so a proxy that ignores
-    /// `stream` still works. Nil for anything that is neither, and for a
-    /// stream that ends before it says it is done — a stream cut short is a
-    /// meeting cut short, and must not be cached as if it were the whole of it.
+    /// `stream` still works. Nil for anything that is neither, for a stream
+    /// that reports an error, and for one that ends before it says it is done
+    /// — a stream cut short is a meeting cut short, and must not be cached as
+    /// if it were the whole of it.
     static func parse(_ raw: Data) -> Response? {
         if let plain = try? JSONDecoder().decode(Response.self, from: raw),
            plain.segments != nil || plain.text != nil {
@@ -249,6 +266,8 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             case "transcript.text.done":
                 text = event.text
                 done = true
+            case "error":
+                return nil
             default:
                 continue
             }
