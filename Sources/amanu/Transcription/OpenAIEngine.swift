@@ -126,7 +126,7 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
         let prefix: @Sendable (Int) -> String? = { count > 1 ? "\($0 + 1)" : nil }
         let first = try await response(
             for: slices[0], cache: cacheURL(in: dir, audio: audio, piece: 0, of: count), voices: [])
-        let voices = count > 1 ? Self.voices(from: first, in: slices[0].url, labelPrefix: "1") : []
+        let voices = prefix(0).map { Self.voices(from: first, in: slices[0].url, labelPrefix: $0) } ?? []
         let known = Set(voices.map(\.name))
         var pieces = [0: Self.segments(from: first, offset: 0, labelPrefix: prefix(0))]
 
@@ -198,11 +198,13 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
         var segments: [Response.Segment] = []
         for line in String(decoding: raw, as: UTF8.self).split(whereSeparator: \.isNewline)
         where line.hasPrefix("data: ") {
+            // A line that cannot be read is an utterance lost, so the whole
+            // stream is asked for again rather than cached without it.
             guard let event = try? JSONDecoder().decode(Event.self, from: Data(line.dropFirst(6).utf8))
-            else { continue }
+            else { return nil }
             switch event.type {
             case "transcript.text.segment":
-                guard let start = event.start, let end = event.end else { continue }
+                guard let start = event.start, let end = event.end else { return nil }
                 segments.append(.init(
                     start: start, end: end, text: event.text ?? "", speaker: event.speaker))
             case "transcript.text.done":
@@ -288,6 +290,14 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
 
     /// One transcription request, streamed from a multipart body on disk.
     private func send(_ audio: URL, voices: [Voice]) async throws -> Data {
+        try await http.sendMultipart(
+            to: Self.endpoint, fields: Self.fields(model: model, expected: expected, voices: voices),
+            file: audio, key: apiKey,
+            what: "transcription", timeout: 300, retryTransportErrors: true)
+    }
+
+    /// The request's form fields. Pure, so what is sent is testable.
+    static func fields(model: String, expected: [String], voices: [Voice]) -> [(String, String)] {
         var fields: [(String, String)] = [
             ("model", model),
             ("response_format", "diarized_json"),
@@ -301,15 +311,13 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             // answered.
             ("stream", "true"),
         ]
-        if let language = Self.languageField(for: expected) {
+        if let language = languageField(for: expected) {
             fields.append(("language", language))
         }
         // Two arrays matched by position.
         fields += voices.map { ("known_speaker_names[]", $0.name) }
         fields += voices.map { ("known_speaker_references[]", $0.sample) }
-        return try await http.sendMultipart(
-            to: Self.endpoint, fields: fields, file: audio, key: apiKey,
-            what: "transcription", timeout: 300, retryTransportErrors: true)
+        return fields
     }
 
     /// The `language` field for a request, or nil to let the model detect.
@@ -324,7 +332,8 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
 
     /// Where one piece's response is cached: named for the model, the
     /// language sent, the limits that decided the cuts, which piece of how
-    /// many it is, and the voices it was told about.
+    /// many it is, and the voices it was told about — the samples too, since
+    /// a first piece heard again may give the same names to other people.
     func cacheURL(
         in dir: URL, audio: URL, piece index: Int, of count: Int, voices: [Voice] = []
     ) -> URL {
@@ -333,7 +342,7 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             parts: [
                 audio.lastPathComponent, model, Self.languageField(for: expected) ?? "detect",
                 "\(requestLimit)", "\(durationLimit)", "\(count)",
-            ] + voices.map(\.name),
+            ] + voices.flatMap { [$0.name, $0.sample] },
             suffix: count > 1 ? "\(index + 1)" : nil)
     }
 

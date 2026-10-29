@@ -82,7 +82,7 @@ enum AudioSlicer {
     }
 
     /// Where to cut a recording of `levels` (RMS per `bucket` seconds) so no
-    /// piece is longer than `seconds`: at the quietest half second of the last
+    /// piece is longer than `seconds`: at the quietest moment of the last
     /// `window` before each limit, the latest of equals. Pure, so where the
     /// cuts fall is testable without audio.
     static func cuts(
@@ -140,17 +140,21 @@ enum AudioSlicer {
             throw SliceError.unreadable(source, nil)
         }
         // A first pass for loudness, because where a cut goes depends on audio
-        // the piece before it does not contain.
-        let bucket = 0.1
+        // the piece before it does not contain. The bucket is a whole number of
+        // frames, and its length in seconds is that number's: at 11,025 Hz a
+        // tenth of a second is 1102.5 frames, and over three hours the half
+        // frame would move a cut seconds away from the pause it chose.
+        let size = max(1, Int(rate / 10))
+        let bucket = Double(size) / rate
         let ends = cuts(
-            levels: try levels(of: file, buffer: buffer, bucket: bucket, source: source),
+            levels: try levels(of: file, buffer: buffer, size: size, source: source),
             bucket: bucket, every: seconds, window: window
         ).map { AVAudioFramePosition(($0 * rate).rounded()) } + [file.length]
         file.framePosition = 0
 
         var slices: [Slice] = []
         var index = 0
-        while file.framePosition < file.length {
+        while index < ends.count, file.framePosition < file.length {
             let start = file.framePosition
             let url = directory.appendingPathComponent(
                 "slice-\(String(format: "%03d", index)).m4a")
@@ -174,6 +178,7 @@ enum AudioSlicer {
                 // The encoder refuses 64k below about 24 kHz — an imported
                 // 16 kHz recording, say — and its own default there is lower.
                 settings[AVEncoderBitRateKey] = nil
+                try? FileManager.default.removeItem(at: url)
                 do {
                     output = try AVAudioFile(
                         forWriting: url, settings: settings,
@@ -213,12 +218,11 @@ enum AudioSlicer {
         return slices
     }
 
-    /// RMS of every `bucket` seconds of `file`, all channels together.
+    /// RMS of every `size` frames of `file`, all channels together.
     private static func levels(
-        of file: AVAudioFile, buffer: AVAudioPCMBuffer, bucket: TimeInterval, source: URL
+        of file: AVAudioFile, buffer: AVAudioPCMBuffer, size: Int, source: URL
     ) throws -> [Float] {
         let channels = Int(file.processingFormat.channelCount)
-        let size = max(1, Int(file.processingFormat.sampleRate * bucket))
         var levels: [Float] = []
         var sum: Float = 0
         var count = 0

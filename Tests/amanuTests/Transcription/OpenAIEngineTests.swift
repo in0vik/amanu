@@ -215,5 +215,40 @@ struct OpenAIEngineTests {
         #expect(OpenAITranscriptionEngine.parse(Data(cut.utf8)) == nil)
         let failed = cut + #"data: {"type":"error","error":{"message":"server_error"}}"#
         #expect(OpenAITranscriptionEngine.parse(Data(failed.utf8)) == nil)
+        let broken = Self.stream.replacingOccurrences(of: #""start":0.8,"#, with: "")
+        #expect(OpenAITranscriptionEngine.parse(Data(broken.utf8)) == nil)
+    }
+
+    /// Past 1400 seconds the API refuses the piece, and the meeting with it.
+    @Test("Pieces stay under the API's 1400 seconds")
+    func durationLimit() {
+        #expect(OpenAITranscriptionEngine.defaultDurationLimit < 1400)
+    }
+
+    @Test("Every piece after the first streams, and is told the first piece's voices in order")
+    func requestFields() {
+        let voices = [("1A", "data:a"), ("1B", "data:b")].map {
+            OpenAITranscriptionEngine.Voice(name: $0.0, sample: $0.1)
+        }
+        let fields = OpenAITranscriptionEngine.fields(
+            model: "gpt-4o-transcribe-diarize", expected: [], voices: voices)
+        #expect(fields.contains { $0 == ("stream", "true") })
+        #expect(fields.filter { $0.0 == "known_speaker_names[]" }.map(\.1) == ["1A", "1B"])
+        #expect(fields.filter { $0.0 == "known_speaker_references[]" }.map(\.1) == ["data:a", "data:b"])
+    }
+
+    /// The first piece heard again can give its names to other voices, and a
+    /// later piece cached under the old ones would then mean other people.
+    @Test("A piece's cache depends on the voices' samples, not only their names")
+    func cacheFollowsVoices() async throws {
+        let engine = try OpenAITranscriptionEngine(apiKey: "test-key")
+        let (folder, audio) = (URL(fileURLWithPath: "/tmp"), URL(fileURLWithPath: "/tmp/mixed.m4a"))
+        func cache(_ sample: String?) async -> URL {
+            await engine.cacheURL(
+                in: folder, audio: audio, piece: 1, of: 3,
+                voices: sample.map { [.init(name: "1A", sample: $0)] } ?? [])
+        }
+        #expect(await cache("data:a") != cache(nil))
+        #expect(await cache("data:a") != cache("data:b"))
     }
 }
