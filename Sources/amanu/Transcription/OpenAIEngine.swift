@@ -11,19 +11,15 @@ import Foundation
 /// returns, which is why both are `.mixed` engines and share everything
 /// downstream.
 ///
-/// Three things about the API leak into the code. A request may carry at most
-/// 1400 seconds of audio and at most 25 MB, so any meeting over about twenty
-/// minutes is cut into pieces — in pauses, not through words — and the timings
-/// shifted back onto the session clock; the person who recorded it never hears
-/// about any of this. Speaker labels are per request, so the first piece is
-/// sent alone and a few seconds of each voice it found go with every later
-/// piece as `known_speaker_references`: the first piece's "1A" stays "1A" to
-/// the end of the meeting instead of becoming a stranger every twenty
-/// minutes. `chunking_strategy` is required for anything over 30 seconds —
-/// the API refuses outright without it, so it is always sent. And every
-/// request is streamed: the server takes about a third of the audio's length
-/// to answer, and a connection with nothing on it for seven minutes does not
-/// survive every network between here and OpenAI.
+/// Three things about the API leak into the code. Requests are capped at 25 MB
+/// and 1400 seconds, and a piece takes far longer to answer the longer it is,
+/// so a meeting is cut into five-minute pieces, sent all at once, and the
+/// timings shifted back onto the session clock; the person who recorded it
+/// never hears about any of this. Speaker labels are per request, so the first
+/// piece goes ahead of the rest and a few seconds of each voice it heard go
+/// with every other as `known_speaker_references`. And `chunking_strategy` is
+/// required for anything over 30 seconds — the API refuses outright without
+/// it, so it is always sent.
 ///
 /// Every response is cached next to the audio (see `ProviderCache`), so a
 /// retry after a crash re-renders from disk instead of re-uploading and
@@ -61,17 +57,21 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
     /// The API's own per-request ceiling. Not a guess: 25 MB is what the
     /// documentation states and what a larger file is refused with.
     static let defaultRequestLimit: Int64 = 25 * 1_048_576
-    /// The longest piece sent. The API's own ceiling for the diarizing model
-    /// is 1400 seconds — "audio duration … is longer than 1400 seconds which
-    /// is the maximum for this model" is its answer to anything longer — and
-    /// the hundred seconds spare are there so that a ceiling moved slightly
-    /// lower does not fail every meeting again.
-    static let defaultDurationLimit: TimeInterval = 1300
-    /// How many pieces are uploaded at once. An hour is three pieces, so this
-    /// is the whole of a usual meeting after its first piece.
-    static let parallelPieces = 3
-    /// The API takes at most four known speakers per request.
+    /// The longest piece. The API refuses anything over 1400 seconds, but the
+    /// reason for five minutes is speed: measured on 29 October 2026, twenty
+    /// minutes took 7–9 minutes as one request and 2.2 minutes as four
+    /// five-minute ones sent together; an hour as twelve took the same. One-
+    /// and two-minute pieces were faster still, by a minute an hour, and give
+    /// the diarizer less of each voice to go on.
+    static let defaultDurationLimit: TimeInterval = 300
+    /// Pieces in flight at once. Sixty were measured without a refusal; this
+    /// covers a three-hour meeting at five minutes a piece in one round.
+    static let parallelPieces = 36
+    /// The API's maximum number of known speakers per request.
     static let maxKnownVoices = 4
+    /// Tries per piece for a stream that stops before it is finished, which
+    /// one in thirty did in the same measurement.
+    static let streamAttempts = 3
 
     nonisolated let name = "openai"
     nonisolated let model: String
@@ -115,71 +115,49 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
     func transcribe(_ audio: URL) async throws -> [TranscriptSegment] {
         let dir = audio.deletingLastPathComponent()
         let slices = try await sliced(audio)
+        if slices.count > 1 {
+            note("\(slices.count) pieces — the mix is over the API's limit")
+        }
+
+        // The first piece goes ahead: every voice it hears is one the rest
+        // are told about. Labels are per request otherwise, so the "A" of one
+        // piece is not the "A" of the next, and each piece's are prefixed.
         let count = slices.count
-        if count > 1 {
-            note("\(count) pieces — the mix is over the API's limits")
-        }
-
-        // The first piece goes alone: every voice it hears is one the later
-        // pieces are told about.
+        let prefix: @Sendable (Int) -> String? = { count > 1 ? "\($0 + 1)" : nil }
         let first = try await response(
-            for: slices[0], cache: cacheURL(in: dir, audio: audio, piece: 0, of: count),
-            voices: [])
-        var segments = Self.segments(
-            from: first, offset: slices[0].offset, labelPrefix: count > 1 ? "1" : nil)
+            for: slices[0], cache: cacheURL(in: dir, audio: audio, piece: 0, of: count), voices: [])
+        let voices = count > 1 ? Self.voices(from: first, in: slices[0].url, labelPrefix: "1") : []
+        let known = Set(voices.map(\.name))
+        var pieces = [0: Self.segments(from: first, offset: 0, labelPrefix: prefix(0))]
 
-        if count > 1 {
-            let voices = Self.voices(from: first, in: slices[0].url, labelPrefix: "1")
-            if !voices.isEmpty {
-                note("telling the later pieces about \(voices.map(\.name).joined(separator: ", "))")
+        try await withThrowingTaskGroup(of: (Int, [TranscriptSegment]).self) { group in
+            var next = 1
+            func start() {
+                guard next < count else { return }
+                let (index, slice) = (next, slices[next])
+                let cache = cacheURL(in: dir, audio: audio, piece: index, of: count, voices: voices)
+                next += 1
+                group.addTask {
+                    let response = try await self.response(for: slice, cache: cache, voices: voices)
+                    return (index, Self.segments(
+                        from: response, offset: slice.offset,
+                        labelPrefix: prefix(index), known: known))
+                }
             }
-            segments += try await rest(of: slices, audio: audio, in: dir, voices: voices)
+            for _ in 0..<Self.parallelPieces { start() }
+            while let (index, segments) = try await group.next() {
+                pieces[index] = segments
+                start()
+            }
         }
+        let segments = pieces.keys.sorted().flatMap { pieces[$0]! }
         Self.discardSlices(slices, of: audio)
 
         guard !segments.isEmpty else { throw EngineError.empty }
         return segments
     }
 
-    /// Every piece after the first, a few at a time, in the order they were
-    /// cut. A piece that fails fails the meeting; the pieces already answered
-    /// are cached, so the retry pays only for what is left.
-    private func rest(
-        of slices: [AudioSlicer.Slice], audio: URL, in dir: URL, voices: [Voice]
-    ) async throws -> [TranscriptSegment] {
-        let count = slices.count
-        let known = Set(voices.map(\.name))
-        return try await withThrowingTaskGroup(of: (Int, [TranscriptSegment]).self) { group in
-            var next = 1
-            func start() {
-                guard next < count else { return }
-                let index = next
-                next += 1
-                let slice = slices[index]
-                let cache = cacheURL(in: dir, audio: audio, piece: index, of: count, voices: voices)
-                group.addTask {
-                    let answer = try await self.response(for: slice, cache: cache, voices: voices)
-                    return (index, Self.segments(
-                        from: answer, offset: slice.offset,
-                        // Labels are per request, so the "A" of one piece is
-                        // not the "A" of the next — unless it is a voice the
-                        // request was told about, which comes back under the
-                        // first piece's own name for it.
-                        labelPrefix: "\(index + 1)", known: known))
-                }
-            }
-            for _ in 0..<Self.parallelPieces { start() }
-
-            var pieces: [Int: [TranscriptSegment]] = [:]
-            while let (index, segments) = try await group.next() {
-                pieces[index] = segments
-                start()
-            }
-            return pieces.keys.sorted().flatMap { pieces[$0] ?? [] }
-        }
-    }
-
-    /// One piece's response, from the cache when an earlier attempt already
+    /// One piece's answer, from the cache when an earlier attempt already
     /// paid for it.
     private func response(
         for slice: AudioSlicer.Slice, cache: URL, voices: [Voice]
@@ -189,152 +167,90 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             note("reusing cached \(cache.lastPathComponent)")
             return decoded
         }
-        // A stream can stop before it is finished — on 29 October 2026 one piece
-        // of an hour-long meeting did, sending its segments but never the
-        // closing event. Asking again costs one piece, not the meeting.
         var ending = ""
         for attempt in 1...Self.streamAttempts {
-            let raw = try await sendAllowingVoices(slice.url, voices: voices)
+            let raw = try await send(slice.url, voices: voices)
             if let decoded = Self.parse(raw) {
-                if let encoded = try? JSONEncoder().encode(decoded) {
-                    try? encoded.write(to: cache, options: .atomic)
-                }
+                try? JSONEncoder().encode(decoded).write(to: cache, options: .atomic)
                 return decoded
             }
-            // The end, not the start: the start of a stream cut short looks
-            // exactly like the start of a whole one.
+            // The end, not the start: a stream cut short starts like a whole one.
             ending = String(decoding: raw.suffix(400), as: UTF8.self)
-            note("\(slice.url.lastPathComponent): the answer stopped before it was finished"
-                + " (try \(attempt) of \(Self.streamAttempts)); it ended with: \(ending)")
+            note("\(slice.url.lastPathComponent) stopped before it was finished"
+                + " (try \(attempt) of \(Self.streamAttempts)); it ended: \(ending)")
         }
         throw CloudHTTP.Failure.malformed(
             service: CloudService.openAI.rawValue, what: "transcription", body: ending)
     }
 
-    /// Tries per piece for an answer that stops before it is finished.
-    static let streamAttempts = 3
-
-    private func sendAllowingVoices(_ audio: URL, voices: [Voice]) async throws -> Data {
-        do {
-            return try await send(audio, voices: voices)
-        } catch let failure as CloudHTTP.Failure
-            where !voices.isEmpty && Self.refusedVoices(failure) {
-            // The samples are a refinement. A service that will not take them
-            // still transcribes the piece, and separate labels beat no text.
-            note("voice samples refused, sending \(audio.lastPathComponent) without them: \(failure)")
-            return try await send(audio, voices: [])
-        }
-    }
-
-    /// A response as the API sends it with `stream=true`: server-sent events,
-    /// one `transcript.text.segment` per utterance, a `transcript.text.done`
-    /// with the whole text, comments to keep the connection open, and
-    /// `[DONE]`. A plain JSON body is taken as well, so a proxy that ignores
-    /// `stream` still works. Nil for anything that is neither, for a stream
-    /// that reports an error, and for one that ends before it says it is done
-    /// — a stream cut short is a meeting cut short, and must not be cached as
-    /// if it were the whole of it.
+    /// An answer sent with `stream=true`: one `transcript.text.segment` event
+    /// per utterance, pings between them, `transcript.text.done`, `[DONE]`.
+    /// Nil for a stream that reports an error or ends before it says it is
+    /// done — a piece cut short must not be cached as if it were the whole.
     static func parse(_ raw: Data) -> Response? {
-        if let plain = try? JSONDecoder().decode(Response.self, from: raw),
-           plain.segments != nil || plain.text != nil {
-            return plain
-        }
         struct Event: Decodable {
-            let type: String?
+            let type: String
             let text: String?
             let speaker: String?
             let start: TimeInterval?
             let end: TimeInterval?
         }
         var segments: [Response.Segment] = []
-        var text: String?
-        var done = false
-        for line in String(decoding: raw, as: UTF8.self).split(whereSeparator: \.isNewline) {
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" {
-                done = true
-                continue
-            }
-            guard let event = try? JSONDecoder().decode(Event.self, from: Data(payload.utf8))
+        for line in String(decoding: raw, as: UTF8.self).split(whereSeparator: \.isNewline)
+        where line.hasPrefix("data: ") {
+            guard let event = try? JSONDecoder().decode(Event.self, from: Data(line.dropFirst(6).utf8))
             else { continue }
             switch event.type {
             case "transcript.text.segment":
                 guard let start = event.start, let end = event.end else { continue }
-                segments.append(Response.Segment(
+                segments.append(.init(
                     start: start, end: end, text: event.text ?? "", speaker: event.speaker))
             case "transcript.text.done":
-                text = event.text
-                done = true
+                return Response(text: event.text, duration: nil, segments: segments)
             case "error":
                 return nil
             default:
                 continue
             }
         }
-        guard done else { return nil }
-        return Response(text: text, duration: nil, segments: segments)
-    }
-
-    static func refusedVoices(_ failure: CloudHTTP.Failure) -> Bool {
-        guard case .rejected(_, _, _, let body) = failure else { return false }
-        return body.contains("known_speaker")
+        return nil
     }
 
     // MARK: - voices
 
-    /// A speaker the later pieces are told about: the name the first piece
-    /// gave them, and a few seconds of their voice as a `data:` URL.
-    struct Voice: Sendable, Equatable {
+    /// A speaker the other pieces are told about: the first piece's name for
+    /// them, and a few seconds of their voice as a `data:` URL.
+    struct Voice: Sendable {
         let name: String
         let sample: String
     }
 
-    /// Where in the first piece each voice worth naming can be heard.
-    ///
-    /// The voices are the ones who talked longest, up to the API's four: the
-    /// rest are the one-word interjections and crosstalk a diarizer splits off
-    /// as speakers of their own, and naming them would only teach the later
-    /// pieces to hear ghosts. Each sample is that voice's longest utterance,
-    /// trimmed to eight seconds — the API takes two to ten — and a voice with
-    /// nothing as long as two seconds is left out rather than sampled from a
-    /// cough. Pure, so the choice is testable without audio.
+    /// Where in the first piece the voices worth naming can be heard: the four
+    /// who talked longest — the API's maximum — each by its longest utterance,
+    /// trimmed to the eight seconds the API's two-to-ten allows. A voice with
+    /// nothing two seconds long is a cough or crosstalk, and is left out.
     static func voiceSamples(
         in segments: [Response.Segment], labelPrefix: String
     ) -> [(name: String, start: TimeInterval, length: TimeInterval)] {
-        var spoken: [String: TimeInterval] = [:]
-        var longest: [String: Response.Segment] = [:]
-        for segment in segments {
-            guard let speaker = segment.speaker, segment.end > segment.start else { continue }
-            let length = segment.end - segment.start
-            spoken[speaker, default: 0] += length
-            if length > (longest[speaker].map { $0.end - $0.start } ?? 0) {
-                longest[speaker] = segment
+        let bySpeaker = Dictionary(grouping: segments.filter { $0.end > $0.start }) { $0.speaker ?? "" }
+            .filter { !$0.key.isEmpty }
+        let talked = bySpeaker.mapValues { $0.reduce(0) { $0 + $1.end - $1.start } }
+        return talked.keys.sorted { (talked[$0]!, $1) > (talked[$1]!, $0) }
+            .compactMap { speaker in
+                let longest = bySpeaker[speaker]!.max { $0.end - $0.start < $1.end - $1.start }!
+                guard longest.end - longest.start >= 2 else { return nil }
+                return (labelPrefix + speaker, longest.start, min(8, longest.end - longest.start))
             }
-        }
-        return spoken.keys
-            .sorted { (spoken[$0]!, $1) > (spoken[$1]!, $0) }
-            .compactMap { speaker -> (String, TimeInterval, TimeInterval)? in
-                guard let segment = longest[speaker], segment.end - segment.start >= 2
-                else { return nil }
-                return (labelPrefix + speaker, segment.start, min(8, segment.end - segment.start))
-            }
-            .prefix(maxKnownVoices)
-            .map { $0 }
+            .prefix(maxKnownVoices).map { $0 }
     }
 
-    /// The samples themselves, cut from the first piece. A voice whose sample
-    /// cannot be cut is left out; the rest still help.
-    static func voices(
-        from response: Response, in piece: URL, labelPrefix: String
-    ) -> [Voice] {
-        voiceSamples(in: response.segments ?? [], labelPrefix: labelPrefix).compactMap { sample in
-            guard let wav = try? AudioClip.wav(
-                from: piece, start: sample.start, length: sample.length)
+    /// The samples, cut from the first piece. One that cannot be cut is left
+    /// out; the rest still help.
+    static func voices(from response: Response, in piece: URL, labelPrefix: String) -> [Voice] {
+        voiceSamples(in: response.segments ?? [], labelPrefix: labelPrefix).compactMap {
+            guard let wav = try? AudioClip.wav(from: piece, start: $0.start, length: $0.length)
             else { return nil }
-            return Voice(
-                name: sample.name,
-                sample: "data:audio/wav;base64," + wav.base64EncodedString())
+            return Voice(name: $0.name, sample: "data:audio/wav;base64," + wav.base64EncodedString())
         }
     }
 
@@ -343,15 +259,12 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
     private func sliced(_ audio: URL) async throws -> [AudioSlicer.Slice] {
         let whole = [AudioSlicer.Slice(url: audio, offset: 0)]
         let attributes = try? FileManager.default.attributesOfItem(atPath: audio.path)
-        let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-        let duration = Self.duration(of: audio)
-        guard duration > 0 else { return whole }
-        let length = AudioSlicer.maxPieceLength(
-            bytes: bytes, duration: duration,
-            requestLimit: requestLimit, durationLimit: durationLimit)
-        guard duration > length || bytes > requestLimit else { return whole }
-        return try await AudioSlicer.slice(
-            audio, maxLength: length, into: Self.sliceDirectory(audio))
+        guard let bytes = attributes?[.size] as? Int64,
+              let length = AudioSlicer.sliceLength(
+                bytes: bytes, duration: Self.duration(of: audio), limit: requestLimit,
+                maxDuration: durationLimit)
+        else { return whole }
+        return try await AudioSlicer.slice(audio, every: length, into: Self.sliceDirectory(audio))
     }
 
     private static func sliceDirectory(_ audio: URL) -> URL {
@@ -381,22 +294,19 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             // Required by the diarizing model for anything over 30 seconds;
             // without it the API answers 400 rather than transcribing.
             ("chunking_strategy", "auto"),
+            // Something arrives every few seconds while the server works, so
+            // five quiet minutes do mean a dead connection. Unstreamed, an
+            // answer can take minutes of silence, and on 28 October 2026 one
+            // from amanu never came while curl's copy of the request was
+            // answered.
+            ("stream", "true"),
         ]
         if let language = Self.languageField(for: expected) {
             fields.append(("language", language))
         }
-        // Two parallel arrays, matched by position.
+        // Two arrays matched by position.
         fields += voices.map { ("known_speaker_names[]", $0.name) }
         fields += voices.map { ("known_speaker_references[]", $0.sample) }
-        // Streamed, so that something arrives every few seconds while the
-        // server works: segments as they are ready, pings between them. The
-        // whole answer to a twenty-minute piece takes seven to nine minutes,
-        // and on 28 October 2026 amanu's request for one, sent without
-        // `stream`, was never answered and waited out its thirty minutes,
-        // while curl sent the same piece twice and was answered both times.
-        // Why is not known. With pings, five minutes of nothing does mean the
-        // connection is gone, and a piece is small enough to send again.
-        fields.append(("stream", "true"))
         return try await http.sendMultipart(
             to: Self.endpoint, fields: fields, file: audio, key: apiKey,
             what: "transcription", timeout: 300, retryTransportErrors: true)
@@ -418,13 +328,12 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
     func cacheURL(
         in dir: URL, audio: URL, piece index: Int, of count: Int, voices: [Voice] = []
     ) -> URL {
-        var parts = [
-            audio.lastPathComponent, model, Self.languageField(for: expected) ?? "detect",
-            "\(requestLimit)", "\(Int(durationLimit))", "\(count)",
-        ]
-        if !voices.isEmpty { parts.append("voices:" + voices.map(\.name).joined(separator: ",")) }
-        return ProviderCache.url(
-            in: dir, provider: .openAI, parts: parts,
+        ProviderCache.url(
+            in: dir, provider: .openAI,
+            parts: [
+                audio.lastPathComponent, model, Self.languageField(for: expected) ?? "detect",
+                "\(requestLimit)", "\(durationLimit)", "\(count)",
+            ] + voices.map(\.name),
             suffix: count > 1 ? "\(index + 1)" : nil)
     }
 
@@ -441,6 +350,8 @@ actor OpenAITranscriptionEngine: TranscriptionEngine {
             return segments.compactMap { segment in
                 let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { return nil }
+                // A voice the request was told about comes back under the
+                // first piece's own name for it.
                 let speaker = segment.speaker.map { label in
                     known.contains(label) ? label : labelPrefix.map { "\($0)\(label)" } ?? label
                 }

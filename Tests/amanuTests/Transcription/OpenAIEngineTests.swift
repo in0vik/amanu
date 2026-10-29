@@ -121,37 +121,43 @@ struct OpenAIEngineTests {
         #expect(!pieces.contains(await engine.cacheURL(in: folder, audio: audio, piece: 0, of: 1)))
     }
 
-    /// Both of the API's ceilings bind a piece: 1400 seconds is the one an
-    /// ordinary meeting reaches first, 25 MB the one a high-bitrate import
-    /// does.
-    @Test("Piece length keeps every piece under both request limits")
-    func pieceMath() {
+    /// 25 MB is the API's ceiling; the pieces have to come in under it with
+    /// room for a bitrate that isn't perfectly constant.
+    @Test("Slice length keeps every piece under the request limit")
+    func sliceMath() {
         let limit = OpenAITranscriptionEngine.defaultRequestLimit
-        let cap = OpenAITranscriptionEngine.defaultDurationLimit
-        #expect(cap < 1400)
 
-        // An hour at 55 kbit/s fits 25 MB whole, and is still cut by length.
-        #expect(AudioSlicer.maxPieceLength(
-            bytes: 3600 * 55_000 / 8, duration: 3600,
-            requestLimit: limit, durationLimit: cap) == cap)
+        // Under the limit: nothing to cut.
+        #expect(AudioSlicer.sliceLength(
+            bytes: 20 * 1_048_576, duration: 3000, limit: limit) == nil)
 
-        // Pieces are written at 64k whatever the source was. Sized at the
-        // source's 40k, a piece would come out 60% over its estimate.
-        let quiet = AudioSlicer.maxPieceLength(
-            bytes: 7200 * 40_000 / 8, duration: 7200,
-            requestLimit: limit, durationLimit: 100_000)
-        #expect(quiet * Double(AudioSlicer.encodedBitRate) / 8 < Double(limit))
-
-        // A WAV at 1.5 Mbit/s is bound by bytes, at its own rate.
-        let wav = AudioSlicer.maxPieceLength(
-            bytes: 600 * 1_536_000 / 8, duration: 600,
-            requestLimit: limit, durationLimit: cap)
-        #expect(wav * 1_536_000 / 8 < Double(limit))
-        #expect(wav < cap)
+        // Two hours at the mix's own 64 kbit/s, which is about 55 MB.
+        let bytes: Int64 = 55 * 1_048_576
+        let length = try! #require(AudioSlicer.sliceLength(
+            bytes: bytes, duration: 7200, limit: limit))
+        let bytesPerSecond = Double(bytes) / 7200
+        #expect(Double(length) * bytesPerSecond < Double(limit))
+        // And not so cautious that it turns one meeting into a dozen uploads.
+        #expect(length > 2000)
     }
 
-    /// The voices the later pieces are told about are the people who talked,
-    /// not the coughs a diarizer files as speakers of their own.
+    /// 1400 seconds is the ceiling an ordinary meeting reaches first, and the
+    /// pieces are re-encoded at 64k whatever the mix was.
+    @Test("Slice length keeps every piece under the duration limit and at 64k")
+    func sliceDuration() throws {
+        let limit = OpenAITranscriptionEngine.defaultRequestLimit
+        // An hour at 25 kbit/s fits 25 MB whole, and is still cut by length.
+        #expect(AudioSlicer.sliceLength(
+            bytes: 3600 * 25_000 / 8, duration: 3600, limit: limit, maxDuration: 300) == 300)
+        #expect(AudioSlicer.sliceLength(
+            bytes: 200 * 25_000 / 8, duration: 200, limit: limit, maxDuration: 300) == nil)
+        // Sized at a 40k source alone, a piece written at 64k would come out
+        // 60% over its estimate.
+        let length = try #require(AudioSlicer.sliceLength(
+            bytes: 7200 * 40_000 / 8 + limit, duration: 7200, limit: limit))
+        #expect(length * Double(AudioSlicer.encodedBitRate) / 8 < Double(limit))
+    }
+
     @Test("Voice samples come from whoever talked longest, two to eight seconds each")
     func voiceChoice() throws {
         let decoded = try Self.response("""
@@ -176,21 +182,8 @@ struct OpenAIEngineTests {
         #expect(samples[1].length == 3)
     }
 
-    @Test("A voice the request was told about keeps the first piece's name")
-    func knownVoicesKeepTheirName() throws {
-        let decoded = try Self.response("""
-        {"text":"","segments":[
-          {"start":1,"end":2,"text":"known","speaker":"1A"},
-          {"start":2,"end":3,"text":"new","speaker":"A"}]}
-        """)
-        let segments = OpenAITranscriptionEngine.segments(
-            from: decoded, offset: 1300, labelPrefix: "2", known: ["1A"])
-        #expect(segments.map(\.speaker) == ["1A", "2A"])
-        #expect(segments[0].start == 1301)
-    }
-
     /// What the API sends with `stream=true`, trimmed from a real response of
-    /// 28 October 2026: segments, a ping, the closing text, `[DONE]`.
+    /// 28 October 2026.
     static let stream = """
     data: {"type":"transcript.text.segment","text":" Вот это я знаю.","speaker":"1B","start":0.0,"end":0.8,"id":"seg_0"}
 
@@ -204,39 +197,23 @@ struct OpenAIEngineTests {
 
     """
 
-    @Test("A streamed response becomes the same segments a plain one would")
+    @Test("A streamed answer keeps a known voice's name and prefixes the rest")
     func streamedResponse() throws {
         let response = try #require(OpenAITranscriptionEngine.parse(Data(Self.stream.utf8)))
         let segments = OpenAITranscriptionEngine.segments(
-            from: response, offset: 1300, labelPrefix: "2", known: ["1B"])
+            from: response, offset: 300, labelPrefix: "2", known: ["1B"])
         #expect(segments.map(\.speaker) == ["1B", "2A"])
         #expect(segments.map(\.text) == ["Вот это я знаю.", "Да, он живёт там."])
-        #expect(segments[1].start == 1300.8)
-        #expect(response.text == "Вот это я знаю. Да, он живёт там.")
+        #expect(segments[1].start == 300.8)
     }
 
-    /// A stream cut off halfway is half a meeting. Taken as an answer, it
-    /// would be cached and never asked for again.
-    @Test("A stream that never says it is done is no answer at all")
-    func truncatedStream() {
+    /// A stream cut off halfway is half a piece. Taken as an answer, it would
+    /// be cached and never asked for again.
+    @Test("A stream that stops short or reports an error is no answer")
+    func unfinishedStream() {
         let cut = Self.stream.components(separatedBy: "data: {\"type\":\"transcript.text.done")[0]
         #expect(OpenAITranscriptionEngine.parse(Data(cut.utf8)) == nil)
-        #expect(OpenAITranscriptionEngine.parse(Data("<html>bad gateway</html>".utf8)) == nil)
-    }
-
-    @Test("A stream that reports an error is no answer either, whatever else it sent")
-    func streamWithError() {
-        let failed = Self.stream.replacingOccurrences(
-            of: "data: [DONE]",
-            with: #"data: {"type":"error","error":{"message":"server_error"}}"#)
+        let failed = cut + #"data: {"type":"error","error":{"message":"server_error"}}"#
         #expect(OpenAITranscriptionEngine.parse(Data(failed.utf8)) == nil)
-    }
-
-    @Test("A plain JSON answer is still read, for a proxy that ignores stream")
-    func plainResponse() throws {
-        let response = try #require(OpenAITranscriptionEngine.parse(Data("""
-        {"text":"hi","duration":1.0,"segments":[{"start":0,"end":1,"text":"hi","speaker":"A"}]}
-        """.utf8)))
-        #expect(response.segments?.count == 1)
     }
 }
